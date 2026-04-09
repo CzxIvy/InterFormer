@@ -1,0 +1,23 @@
+﻿{
+  "name": "amazon_electronics",
+  "data": {
+    "label_col": "label",
+    "user_id_col": "user_id",
+    "dense_cols": [],
+    "sparse_cols": ["item_id", "cate_id"],
+    "seq_cols": ["item_history", "cate_history"],
+    "sparse_vocab_sizes": [63001, 801],
+    "seq_vocab_sizes": [63001, 801],
+    "max_seq_len": 100,
+    "seq_delim": " "
+  },
+  "model": {
+    "d_model": 64,
+    "n_layers": 3,
+    "n_heads": 4,
+    "dropout": 0.1,
+    "n_nonseq_summary": 4,
+    "n_pma_tokens": 2,
+    "n_recent_tokens": 2
+  }
+}

@@ -1,0 +1,23 @@
+﻿{
+  "name": "kuaivideo",
+  "data": {
+    "label_col": "label",
+    "user_id_col": "user_id",
+    "dense_cols": ["video_duration"],
+    "sparse_cols": ["video_id", "author_id", "user_device", "user_gender"],
+    "seq_cols": ["hist_click_video_id", "hist_like_video_id", "hist_not_click_video_id", "hist_share_video_id"],
+    "sparse_vocab_sizes": [500000, 200000, 30, 3],
+    "seq_vocab_sizes": [500000, 500000, 500000, 500000],
+    "max_seq_len": 100,
+    "seq_delim": " "
+  },
+  "model": {
+    "d_model": 64,
+    "n_layers": 3,
+    "n_heads": 4,
+    "dropout": 0.1,
+    "n_nonseq_summary": 4,
+    "n_pma_tokens": 2,
+    "n_recent_tokens": 2
+  }
+}

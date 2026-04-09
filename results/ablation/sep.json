@@ -1,0 +1,34 @@
+{
+  "interleave_mode": "sep",
+  "interaction_arch": "dhen",
+  "use_rope": false,
+  "epochs": 3,
+  "train_logloss": 0.4026564657688141,
+  "val": {
+    "auc": 0.5,
+    "gauc": 0.5,
+    "logloss": 0.22155600786209106
+  },
+  "test": null,
+  "run_config": {
+    "dataset_config": "configs/datasets/amazon_electronics.json",
+    "train_path": "data/sample_train.csv",
+    "val_path": "data/sample_val.csv",
+    "test_path": "",
+    "epochs": 3,
+    "batch_size": 64,
+    "lr": 0.001,
+    "num_workers": 0,
+    "device": "cpu",
+    "interaction_arch": "dhen",
+    "interleave_mode": "sep",
+    "use_rope": false,
+    "rope_base": 10000.0,
+    "use_wandb": false,
+    "wandb_project": "interformer-repro",
+    "wandb_run_name": "",
+    "wandb_entity": "",
+    "wandb_log_interval": 50,
+    "save_metrics_path": "results\\ablation\\sep.json"
+  }
+}

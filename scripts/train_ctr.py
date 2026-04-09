@@ -1,0 +1,310 @@
+﻿from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+from pathlib import Path
+import sys
+from typing import Any, Dict
+
+import torch
+import torch.nn.functional as F
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from data.ctr_dataset import CTRDatasetSpec, build_ctr_dataloader
+from model import build_interformer, default_interformer_config
+from utils.metrics import auc_score, gauc_score, logloss_score
+
+
+def load_json(path: str | Path) -> Dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def maybe_init_wandb(cfg_cli: Dict[str, Any], cfg_model):
+    if not cfg_cli.get("use_wandb", False):
+        return None
+    try:
+        import wandb  # type: ignore
+    except ImportError:
+        print("[warn] use_wandb=true, but `wandb` is not installed. Continue without wandb logging.")
+        return None
+
+    run = wandb.init(
+        project=cfg_cli.get("wandb_project", "interformer-repro"),
+        entity=cfg_cli.get("wandb_entity") or None,
+        name=cfg_cli.get("wandb_run_name") or None,
+        config={
+            **cfg_cli,
+            "model_config": asdict(cfg_model),
+        },
+    )
+    return run
+
+
+def evaluate(model, loader, device):
+    model.eval()
+    all_labels = []
+    all_probs = []
+    all_users = []
+    with torch.no_grad():
+        for batch in loader:
+            dense = batch["dense"].to(device)
+            sparse = batch["sparse"].to(device)
+            seq = batch["seq"].to(device)
+            label = batch["label"].to(device)
+            user_ids = batch["user_id"]
+
+            logits = model(dense, sparse, seq)
+            prob = torch.sigmoid(logits)
+
+            all_labels.append(label.detach().cpu())
+            all_probs.append(prob.detach().cpu())
+            all_users.extend(user_ids)
+
+    y = torch.cat(all_labels)
+    p = torch.cat(all_probs)
+    return {
+        "auc": auc_score(y, p),
+        "gauc": gauc_score(all_users, y, p),
+        "logloss": logloss_score(y, p),
+    }
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train InterFormer on CTR dataset. Prefer --run-config JSON and use CLI for overrides."
+    )
+    parser.add_argument("--run-config", type=str, default="configs/train_ctr.local.json")
+
+    parser.add_argument("--dataset-config", type=str, default=None)
+    parser.add_argument("--train-path", type=str, default=None)
+    parser.add_argument("--val-path", type=str, default=None)
+    parser.add_argument("--test-path", type=str, default=None)
+
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+
+    parser.add_argument("--interaction-arch", type=str, choices=["dhen", "mha"], default=None)
+    parser.add_argument("--interleave-mode", type=str, choices=["sole", "sep", "n2s", "s2n", "int"], default=None)
+    parser.add_argument("--use-rope", action="store_true")
+    parser.add_argument("--rope-base", type=float, default=None)
+
+    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-log-interval", type=int, default=None)
+
+    parser.add_argument("--save-metrics-path", type=str, default=None)
+    return parser.parse_args()
+
+
+def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
+    defaults = {
+        "dataset_config": "configs/datasets/amazon_electronics.json",
+        "train_path": "",
+        "val_path": "",
+        "test_path": "",
+        "epochs": 5,
+        "batch_size": 512,
+        "lr": 1e-3,
+        "num_workers": 0,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "interaction_arch": "dhen",
+        "interleave_mode": "int",
+        "use_rope": False,
+        "rope_base": 10000.0,
+        "use_wandb": False,
+        "wandb_project": "interformer-repro",
+        "wandb_run_name": "",
+        "wandb_entity": "",
+        "wandb_log_interval": 50,
+        "save_metrics_path": "",
+    }
+
+    file_cfg: Dict[str, Any] = {}
+    if args.run_config and Path(args.run_config).exists():
+        file_cfg = load_json(args.run_config)
+
+    cli_cfg = {
+        "dataset_config": args.dataset_config,
+        "train_path": args.train_path,
+        "val_path": args.val_path,
+        "test_path": args.test_path,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "num_workers": args.num_workers,
+        "device": args.device,
+        "interaction_arch": args.interaction_arch,
+        "interleave_mode": args.interleave_mode,
+        "rope_base": args.rope_base,
+        "wandb_project": args.wandb_project,
+        "wandb_run_name": args.wandb_run_name,
+        "wandb_entity": args.wandb_entity,
+        "wandb_log_interval": args.wandb_log_interval,
+        "save_metrics_path": args.save_metrics_path,
+    }
+
+    merged = {**defaults, **file_cfg}
+    for k, v in cli_cfg.items():
+        if v is not None:
+            merged[k] = v
+
+    if args.use_rope:
+        merged["use_rope"] = True
+    if args.use_wandb:
+        merged["use_wandb"] = True
+
+    missing = [k for k in ["train_path", "val_path"] if not merged.get(k)]
+    if missing:
+        raise ValueError(f"Missing required runtime config fields: {missing}. Set them in --run-config or CLI.")
+
+    return merged
+
+
+def main() -> None:
+    args = _parse_args()
+    run_cfg = _build_runtime_cfg(args)
+
+    ds_cfg = load_json(run_cfg["dataset_config"])
+    spec = CTRDatasetSpec.from_dict(ds_cfg["data"])
+
+    cfg = default_interformer_config()
+    cfg.num_dense = len(spec.dense_cols)
+    cfg.sparse_vocab_sizes = list(spec.sparse_vocab_sizes)
+    cfg.seq_vocab_sizes = list(spec.seq_vocab_sizes)
+    cfg.max_seq_len = spec.max_seq_len
+
+    for k, v in ds_cfg.get("model", {}).items():
+        setattr(cfg, k, v)
+
+    cfg.interaction_arch = run_cfg["interaction_arch"]
+    cfg.interleave_mode = run_cfg["interleave_mode"]
+    cfg.use_rope = run_cfg["use_rope"]
+    cfg.rope_base = run_cfg["rope_base"]
+
+    model = build_interformer(asdict(cfg)).to(run_cfg["device"])
+
+    train_loader = build_ctr_dataloader(
+        file_path=run_cfg["train_path"],
+        spec=spec,
+        batch_size=run_cfg["batch_size"],
+        shuffle=True,
+        num_workers=run_cfg["num_workers"],
+    )
+    val_loader = build_ctr_dataloader(
+        file_path=run_cfg["val_path"],
+        spec=spec,
+        batch_size=run_cfg["batch_size"],
+        shuffle=False,
+        num_workers=run_cfg["num_workers"],
+    )
+    test_loader = None
+    if run_cfg["test_path"]:
+        test_loader = build_ctr_dataloader(
+            file_path=run_cfg["test_path"],
+            spec=spec,
+            batch_size=run_cfg["batch_size"],
+            shuffle=False,
+            num_workers=run_cfg["num_workers"],
+        )
+
+    opt = torch.optim.Adam(model.parameters(), lr=run_cfg["lr"])
+    wandb_run = maybe_init_wandb(run_cfg, cfg)
+
+    last_train_logloss = 0.0
+    last_val_metrics = {"auc": 0.0, "gauc": 0.0, "logloss": 0.0}
+
+    global_step = 0
+    for epoch in range(1, run_cfg["epochs"] + 1):
+        model.train()
+        total_train_loss = 0.0
+        total_samples = 0
+
+        for batch in train_loader:
+            dense = batch["dense"].to(run_cfg["device"])
+            sparse = batch["sparse"].to(run_cfg["device"])
+            seq = batch["seq"].to(run_cfg["device"])
+            label = batch["label"].to(run_cfg["device"])
+
+            logits = model(dense, sparse, seq)
+            loss = F.binary_cross_entropy_with_logits(logits, label)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            bsz = dense.size(0)
+            total_train_loss += loss.item() * bsz
+            total_samples += bsz
+            global_step += 1
+
+            if wandb_run is not None and global_step % run_cfg["wandb_log_interval"] == 0:
+                wandb_run.log({"train/batch_logloss": loss.item(), "train/epoch": epoch}, step=global_step)
+
+        train_logloss = total_train_loss / max(total_samples, 1)
+        val_metrics = evaluate(model, val_loader, run_cfg["device"])
+
+        last_train_logloss = train_logloss
+        last_val_metrics = val_metrics
+
+        print(
+            f"epoch={epoch} "
+            f"mode={run_cfg['interleave_mode']} "
+            f"interaction_arch={run_cfg['interaction_arch']} "
+            f"train_logloss={train_logloss:.5f} "
+            f"val_auc={val_metrics['auc']:.5f} "
+            f"val_gauc={val_metrics['gauc']:.5f} "
+            f"val_logloss={val_metrics['logloss']:.5f}"
+        )
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "train/epoch_logloss": train_logloss,
+                    "val/auc": val_metrics["auc"],
+                    "val/gauc": val_metrics["gauc"],
+                    "val/logloss": val_metrics["logloss"],
+                    "train/epoch": epoch,
+                },
+                step=global_step,
+            )
+
+    test_metrics = None
+    if test_loader is not None:
+        test_metrics = evaluate(model, test_loader, run_cfg["device"])
+        print(
+            f"test_auc={test_metrics['auc']:.5f} "
+            f"test_gauc={test_metrics['gauc']:.5f} "
+            f"test_logloss={test_metrics['logloss']:.5f}"
+        )
+
+    if run_cfg.get("save_metrics_path"):
+        out_path = Path(run_cfg["save_metrics_path"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "interleave_mode": run_cfg["interleave_mode"],
+            "interaction_arch": run_cfg["interaction_arch"],
+            "use_rope": run_cfg["use_rope"],
+            "epochs": run_cfg["epochs"],
+            "train_logloss": last_train_logloss,
+            "val": last_val_metrics,
+            "test": test_metrics,
+            "run_config": run_cfg,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if wandb_run is not None:
+        wandb_run.finish()
+
+
+if __name__ == "__main__":
+    main()

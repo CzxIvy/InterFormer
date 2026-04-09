@@ -1,0 +1,10 @@
+﻿{
+  "name": "ablation_base",
+  "run_config": "configs/train_ctr.local.json",
+  "modes": ["sole", "sep", "n2s", "s2n", "int"],
+  "interaction_arch": "dhen",
+  "use_rope": false,
+  "output_dir": "results/ablation",
+  "summary_csv": "results/ablation/summary.csv",
+  "python_bin": "python"
+}

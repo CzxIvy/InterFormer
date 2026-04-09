@@ -1,0 +1,23 @@
+﻿{
+  "name": "taobao_ads",
+  "data": {
+    "label_col": "label",
+    "user_id_col": "user_id",
+    "dense_cols": ["item_price", "user_age"],
+    "sparse_cols": ["ad_id", "item_id", "item_category", "brand_id", "user_gender", "pid", "campaign_id"],
+    "seq_cols": ["hist_item_id", "hist_item_category", "hist_brand_id"],
+    "sparse_vocab_sizes": [1000000, 500000, 5000, 100000, 3, 1000, 50000],
+    "seq_vocab_sizes": [500000, 5000, 100000],
+    "max_seq_len": 50,
+    "seq_delim": " "
+  },
+  "model": {
+    "d_model": 64,
+    "n_layers": 3,
+    "n_heads": 4,
+    "dropout": 0.1,
+    "n_nonseq_summary": 4,
+    "n_pma_tokens": 2,
+    "n_recent_tokens": 2
+  }
+}
