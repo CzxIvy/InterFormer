@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,11 +41,11 @@ class CTRDatasetSpec:
 def _load_rows(path: Path) -> List[Dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             return list(csv.DictReader(f))
     if suffix in {".jsonl", ".json"}:
         rows: List[Dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -79,6 +80,40 @@ def _safe_bucket(v: int, vocab_size: int) -> int:
     return int(v) % vocab_size
 
 
+def _stable_hash_to_bucket(text: str, vocab_size: int) -> int:
+    if vocab_size <= 0:
+        # fallback bucket for unknown vocab
+        return 0
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
+    return int(digest, 16) % vocab_size
+
+
+def _parse_sparse_to_id(value: Any, vocab_size: int) -> int:
+    """
+    Parse sparse value to integer id.
+    - int/float/numeric-string: use numeric value then bucket.
+    - non-numeric string (e.g. u1): stable-hash into bucket.
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, int):
+        return _safe_bucket(value, vocab_size)
+
+    if isinstance(value, float):
+        return _safe_bucket(int(value), vocab_size)
+
+    s = str(value).strip()
+    if not s:
+        return 0
+
+    try:
+        v = int(s)
+        return _safe_bucket(v, vocab_size)
+    except ValueError:
+        return _stable_hash_to_bucket(s, vocab_size)
+
+
 class CTRDataset(Dataset):
     def __init__(self, file_path: str | Path, spec: CTRDatasetSpec) -> None:
         super().__init__()
@@ -101,7 +136,7 @@ class CTRDataset(Dataset):
 
         sparse_vals = []
         for c, vocab in zip(self.spec.sparse_cols, self.spec.sparse_vocab_sizes):
-            sparse_vals.append(_safe_bucket(int(row.get(c, 0)), vocab))
+            sparse_vals.append(_parse_sparse_to_id(row.get(c, 0), vocab))
         sparse = torch.tensor(sparse_vals, dtype=torch.long)
 
         seq_fields = []
@@ -142,3 +177,4 @@ def build_ctr_dataloader(
         collate_fn=ctr_collate_fn,
         pin_memory=torch.cuda.is_available(),
     )
+

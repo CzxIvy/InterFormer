@@ -4,9 +4,9 @@
     "label_col": "label",
     "user_id_col": "user_id",
     "dense_cols": [],
-    "sparse_cols": ["item_id", "cate_id"],
+    "sparse_cols": ["user_id", "item_id", "cate_id"],
     "seq_cols": ["item_history", "cate_history"],
-    "sparse_vocab_sizes": [63001, 801],
+    "sparse_vocab_sizes": [192403, 63001, 801],
     "seq_vocab_sizes": [63001, 801],
     "max_seq_len": 100,
     "seq_delim": " "
