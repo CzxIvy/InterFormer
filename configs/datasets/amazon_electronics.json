@@ -9,7 +9,7 @@
     "sparse_vocab_sizes": [192403, 63001, 801],
     "seq_vocab_sizes": [63001, 801],
     "max_seq_len": 100,
-    "seq_delim": " "
+    "seq_delim": "^"
   },
   "model": {
     "d_model": 64,

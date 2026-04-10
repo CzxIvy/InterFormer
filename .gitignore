@@ -1,3 +1,4 @@
 ﻿data/*
+wandb/*
 !data/ctr_dataset.py
 !data/__init__.py

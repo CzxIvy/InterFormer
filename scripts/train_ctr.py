@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict
 
 import torch
@@ -17,6 +18,15 @@ if str(ROOT) not in sys.path:
 from data.ctr_dataset import CTRDatasetSpec, build_ctr_dataloader
 from model import build_interformer, default_interformer_config
 from utils.metrics import auc_score, gauc_score, logloss_score
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def load_json(path: str | Path) -> Dict[str, Any]:
@@ -101,6 +111,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-log-interval", type=int, default=None)
+    parser.add_argument("--progress-interval", type=int, default=None)
+    parser.add_argument("--no-progress-bar", action="store_true")
+    parser.add_argument("--early-stop-patience", type=int, default=None)
+    parser.add_argument("--early-stop-min-delta", type=float, default=None)
+    parser.add_argument(
+        "--early-stop-metric",
+        type=str,
+        choices=["val_logloss", "val_auc", "val_gauc"],
+        default=None,
+    )
 
     parser.add_argument("--save-metrics-path", type=str, default=None)
     return parser.parse_args()
@@ -126,6 +146,11 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "wandb_run_name": "",
         "wandb_entity": "",
         "wandb_log_interval": 50,
+        "progress_interval": 50,
+        "progress_bar": True,
+        "early_stop_patience": 0,
+        "early_stop_min_delta": 0.0,
+        "early_stop_metric": "val_logloss",
         "save_metrics_path": "",
     }
 
@@ -150,6 +175,10 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "wandb_run_name": args.wandb_run_name,
         "wandb_entity": args.wandb_entity,
         "wandb_log_interval": args.wandb_log_interval,
+        "progress_interval": args.progress_interval,
+        "early_stop_patience": args.early_stop_patience,
+        "early_stop_min_delta": args.early_stop_min_delta,
+        "early_stop_metric": args.early_stop_metric,
         "save_metrics_path": args.save_metrics_path,
     }
 
@@ -162,6 +191,8 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         merged["use_rope"] = True
     if args.use_wandb:
         merged["use_wandb"] = True
+    if args.no_progress_bar:
+        merged["progress_bar"] = False
 
     missing = [k for k in ["train_path", "val_path"] if not merged.get(k)]
     if missing:
@@ -223,13 +254,26 @@ def main() -> None:
     last_train_logloss = 0.0
     last_val_metrics = {"auc": 0.0, "gauc": 0.0, "logloss": 0.0}
 
+    early_stop_metric = str(run_cfg.get("early_stop_metric", "val_logloss"))
+    early_stop_patience = int(run_cfg.get("early_stop_patience", 0))
+    early_stop_min_delta = float(run_cfg.get("early_stop_min_delta", 0.0))
+
+    metric_mode = "min" if early_stop_metric == "val_logloss" else "max"
+    best_metric = float("inf") if metric_mode == "min" else float("-inf")
+    best_epoch = 0
+    bad_epochs = 0
+
     global_step = 0
     for epoch in range(1, run_cfg["epochs"] + 1):
         model.train()
         total_train_loss = 0.0
         total_samples = 0
+        n_batches = len(train_loader)
+        epoch_start = time.time()
+        progress_interval = max(1, int(run_cfg.get("progress_interval", 50)))
+        use_progress_bar = bool(run_cfg.get("progress_bar", True))
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader, start=1):
             dense = batch["dense"].to(run_cfg["device"])
             sparse = batch["sparse"].to(run_cfg["device"])
             seq = batch["seq"].to(run_cfg["device"])
@@ -246,6 +290,27 @@ def main() -> None:
             total_train_loss += loss.item() * bsz
             total_samples += bsz
             global_step += 1
+
+            is_last_batch = batch_idx == n_batches
+            if batch_idx == 1 or batch_idx % progress_interval == 0 or is_last_batch:
+                elapsed = time.time() - epoch_start
+                sec_per_batch = elapsed / max(batch_idx, 1)
+                eta_sec = sec_per_batch * max(n_batches - batch_idx, 0)
+                pct = 100.0 * batch_idx / max(n_batches, 1)
+                avg_loss = total_train_loss / max(total_samples, 1)
+                filled = int((pct / 100.0) * 24)
+                bar = "=" * filled + "." * (24 - filled)
+                line = (
+                    f"[train] e{epoch}/{run_cfg['epochs']} "
+                    f"[{bar}] {pct:5.1f}% "
+                    f"b{batch_idx}/{n_batches} "
+                    f"loss={loss.item():.5f} avg={avg_loss:.5f} "
+                    f"{sec_per_batch:.3f}s/b eta={_format_seconds(eta_sec)}"
+                )
+                if use_progress_bar:
+                    print(line.ljust(140), end="\n" if is_last_batch else "\r", flush=True)
+                else:
+                    print(line)
 
             if wandb_run is not None and global_step % run_cfg["wandb_log_interval"] == 0:
                 wandb_run.log({"train/batch_logloss": loss.item(), "train/epoch": epoch}, step=global_step)
@@ -278,6 +343,34 @@ def main() -> None:
                 step=global_step,
             )
 
+        monitor_values = {
+            "val_logloss": val_metrics["logloss"],
+            "val_auc": val_metrics["auc"],
+            "val_gauc": val_metrics["gauc"],
+        }
+        current_metric = monitor_values[early_stop_metric]
+
+        if metric_mode == "min":
+            improved = current_metric < (best_metric - early_stop_min_delta)
+        else:
+            improved = current_metric > (best_metric + early_stop_min_delta)
+
+        if improved:
+            best_metric = current_metric
+            best_epoch = epoch
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if early_stop_patience > 0 and bad_epochs >= early_stop_patience:
+            print(
+                f"[early-stop] stop at epoch={epoch} "
+                f"monitor={early_stop_metric} current={current_metric:.5f} "
+                f"best={best_metric:.5f} best_epoch={best_epoch} "
+                f"patience={early_stop_patience} min_delta={early_stop_min_delta}"
+            )
+            break
+
     test_metrics = None
     if test_loader is not None:
         test_metrics = evaluate(model, test_loader, run_cfg["device"])
@@ -298,6 +391,13 @@ def main() -> None:
             "train_logloss": last_train_logloss,
             "val": last_val_metrics,
             "test": test_metrics,
+            "early_stop": {
+                "metric": early_stop_metric,
+                "patience": early_stop_patience,
+                "min_delta": early_stop_min_delta,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+            },
             "run_config": run_cfg,
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
