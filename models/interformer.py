@@ -83,25 +83,24 @@ class Gating(nn.Module):
 
 
 class SequencePreprocessor(nn.Module):
-    """Approximate MaskNet/LCE on multiple behavior sequences."""
+    """MaskNet-style preprocessing: self-mask then LCE compression."""
 
     def __init__(self, cfg: InterFormerConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.seq_embeddings = nn.ModuleList([nn.Embedding(v, cfg.d_model) for v in cfg.seq_vocab_sizes])
-        self.field_compress = nn.Linear(cfg.num_seq_fields, 1)
-        self.mask_mlp = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_model), nn.SiLU(), nn.Linear(cfg.d_model, cfg.d_model))
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        seq_in_dim = cfg.num_seq_fields * cfg.d_model
+        self.mask_mlp = nn.Sequential(nn.Linear(seq_in_dim, seq_in_dim), nn.SiLU(), nn.Linear(seq_in_dim, seq_in_dim))
+        self.lce_mlp = nn.Linear(seq_in_dim, cfg.d_model)
 
     def forward(self, seq_x: torch.Tensor) -> torch.Tensor:
         # seq_x: [B, K, T]
         embeds = []
         for i, emb in enumerate(self.seq_embeddings):
             embeds.append(emb(seq_x[:, i, :]))  # [B, T, D]
-        x = torch.stack(embeds, dim=-1)  # [B, T, D, K]
-        x = self.field_compress(x).squeeze(-1)  # [B, T, D]
+        x = torch.cat(embeds, dim=-1)  # [B, T, K*D]
         x = x * torch.sigmoid(self.mask_mlp(x))
-        return self.out_proj(x)
+        return self.lce_mlp(x)
 
 
 class PersonalizedFFN(nn.Module):

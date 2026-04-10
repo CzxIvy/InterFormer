@@ -105,6 +105,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--interleave-mode", type=str, choices=["sole", "sep", "n2s", "s2n", "int"], default=None)
     parser.add_argument("--use-rope", action="store_true")
     parser.add_argument("--rope-base", type=float, default=None)
+    parser.add_argument("--scheduler", type=str, choices=["none", "cosine", "step"], default=None)
+    parser.add_argument("--scheduler-t-max", type=int, default=None)
+    parser.add_argument("--scheduler-min-lr", type=float, default=None)
+    parser.add_argument("--scheduler-step-size", type=int, default=None)
+    parser.add_argument("--scheduler-gamma", type=float, default=None)
 
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
@@ -141,6 +146,11 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "interleave_mode": "int",
         "use_rope": False,
         "rope_base": 10000.0,
+        "scheduler": "none",
+        "scheduler_t_max": 100,
+        "scheduler_min_lr": 0.0,
+        "scheduler_step_size": 10,
+        "scheduler_gamma": 0.9,
         "use_wandb": False,
         "wandb_project": "interformer-repro",
         "wandb_run_name": "",
@@ -171,6 +181,11 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "interaction_arch": args.interaction_arch,
         "interleave_mode": args.interleave_mode,
         "rope_base": args.rope_base,
+        "scheduler": args.scheduler,
+        "scheduler_t_max": args.scheduler_t_max,
+        "scheduler_min_lr": args.scheduler_min_lr,
+        "scheduler_step_size": args.scheduler_step_size,
+        "scheduler_gamma": args.scheduler_gamma,
         "wandb_project": args.wandb_project,
         "wandb_run_name": args.wandb_run_name,
         "wandb_entity": args.wandb_entity,
@@ -249,6 +264,24 @@ def main() -> None:
         )
 
     opt = torch.optim.Adam(model.parameters(), lr=run_cfg["lr"])
+    scheduler_name = str(run_cfg.get("scheduler", "none")).lower()
+    if scheduler_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=int(run_cfg.get("scheduler_t_max", run_cfg["epochs"])),
+            eta_min=float(run_cfg.get("scheduler_min_lr", 0.0)),
+        )
+    elif scheduler_name == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            opt,
+            step_size=int(run_cfg.get("scheduler_step_size", 10)),
+            gamma=float(run_cfg.get("scheduler_gamma", 0.9)),
+        )
+    elif scheduler_name == "none":
+        scheduler = None
+    else:
+        raise ValueError(f"Unsupported scheduler: {scheduler_name}. Use one of ['none', 'cosine', 'step']")
+
     wandb_run = maybe_init_wandb(run_cfg, cfg)
 
     last_train_logloss = 0.0
@@ -328,7 +361,8 @@ def main() -> None:
             f"train_logloss={train_logloss:.5f} "
             f"val_auc={val_metrics['auc']:.5f} "
             f"val_gauc={val_metrics['gauc']:.5f} "
-            f"val_logloss={val_metrics['logloss']:.5f}"
+            f"val_logloss={val_metrics['logloss']:.5f} "
+            f"lr={opt.param_groups[0]['lr']:.8f}"
         )
 
         if wandb_run is not None:
@@ -338,10 +372,14 @@ def main() -> None:
                     "val/auc": val_metrics["auc"],
                     "val/gauc": val_metrics["gauc"],
                     "val/logloss": val_metrics["logloss"],
+                    "train/lr": opt.param_groups[0]["lr"],
                     "train/epoch": epoch,
                 },
                 step=global_step,
             )
+
+        if scheduler is not None:
+            scheduler.step()
 
         monitor_values = {
             "val_logloss": val_metrics["logloss"],

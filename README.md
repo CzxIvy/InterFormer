@@ -22,6 +22,8 @@ PyTorch implementation for CTR prediction with heterogeneous feature interaction
 - scripts/run_ablation.py: 一键消融实验
 - configs/datasets/*.json: 数据集字段模板
 - configs/train_ctr.local.json: 训练运行配置
+- configs/train_ctr.repro.cosine.json: 论文复现实验模板（Cosine LR）
+- configs/train_ctr.repro.step.json: 论文复现实验模板（Step LR）
 - configs/ablation.local.json: 消融运行配置
 
 ## 3. 环境准备
@@ -118,6 +120,11 @@ python scripts/train_ctr.py --progress-interval 10 --no-progress-bar
 - --interaction-arch: dhen 或 mha
 - --interleave-mode: sole / sep / n2s / s2n / int
 - --use-rope --rope-base: 是否开启 RoPE 及其 base
+- --scheduler: 学习率调度器（none / cosine / step）
+- --scheduler-t-max: cosine 调度器的 T_max
+- --scheduler-min-lr: cosine 调度器的最小学习率
+- --scheduler-step-size: step 调度器的 step_size
+- --scheduler-gamma: step 调度器的 gamma
 - --progress-interval: 多少个 batch 打印一次进度
 - --no-progress-bar: 关闭动态进度条，改为多行日志
 - --early-stop-patience: 早停耐心轮数，0 表示关闭早停
@@ -138,6 +145,13 @@ python scripts/train_ctr.py \
 	--early-stop-metric val_logloss \
 	--early-stop-min-delta 1e-4 \
 	--save-metrics-path results/one_run.json
+```
+
+论文复现实验模板：
+
+```bash
+python scripts/train_ctr.py --run-config configs/train_ctr.repro.cosine.json
+python scripts/train_ctr.py --run-config configs/train_ctr.repro.step.json
 ```
 
 ## 6. 配置优先级

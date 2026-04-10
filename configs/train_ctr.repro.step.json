@@ -1,4 +1,4 @@
-﻿{
+{
   "dataset_config": "configs/datasets/amazon_electronics.json",
   "train_path": "data/AmazonElectronics_x1/train.csv",
   "val_path": "data/AmazonElectronics_x1/test.csv",
@@ -13,7 +13,8 @@
   "interleave_mode": "int",
   "use_rope": false,
   "rope_base": 10000.0,
-  "scheduler": "cosine",
+
+  "scheduler": "step",
   "scheduler_t_max": 100,
   "scheduler_min_lr": 0.0,
   "scheduler_step_size": 10,
@@ -21,7 +22,7 @@
 
   "use_wandb": true,
   "wandb_project": "interformer-repro",
-  "wandb_run_name": "",
+  "wandb_run_name": "repro-step",
   "wandb_entity": "",
   "wandb_log_interval": 50,
 
