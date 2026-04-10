@@ -111,6 +111,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-step-size", type=int, default=None)
     parser.add_argument("--scheduler-gamma", type=float, default=None)
 
+    parser.add_argument("--warmup-epochs", type=int, default=None)
+    parser.add_argument("--grad-clip-norm", type=float, default=None)
+    parser.add_argument("--no-nan-guard", action="store_true")
+
     parser.add_argument("--use-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -151,6 +155,9 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "scheduler_min_lr": 0.0,
         "scheduler_step_size": 10,
         "scheduler_gamma": 0.9,
+        "warmup_epochs": 0,
+        "grad_clip_norm": 0.0,
+        "nan_guard": True,
         "use_wandb": False,
         "wandb_project": "interformer-repro",
         "wandb_run_name": "",
@@ -186,6 +193,8 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "scheduler_min_lr": args.scheduler_min_lr,
         "scheduler_step_size": args.scheduler_step_size,
         "scheduler_gamma": args.scheduler_gamma,
+        "warmup_epochs": args.warmup_epochs,
+        "grad_clip_norm": args.grad_clip_norm,
         "wandb_project": args.wandb_project,
         "wandb_run_name": args.wandb_run_name,
         "wandb_entity": args.wandb_entity,
@@ -208,12 +217,23 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         merged["use_wandb"] = True
     if args.no_progress_bar:
         merged["progress_bar"] = False
+    if args.no_nan_guard:
+        merged["nan_guard"] = False
 
     missing = [k for k in ["train_path", "val_path"] if not merged.get(k)]
     if missing:
         raise ValueError(f"Missing required runtime config fields: {missing}. Set them in --run-config or CLI.")
 
     return merged
+
+
+def _set_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def _all_finite(t: torch.Tensor) -> bool:
+    return bool(torch.isfinite(t).all().item())
 
 
 def main() -> None:
@@ -263,7 +283,8 @@ def main() -> None:
             num_workers=run_cfg["num_workers"],
         )
 
-    opt = torch.optim.Adam(model.parameters(), lr=run_cfg["lr"])
+    base_lr = float(run_cfg["lr"])
+    opt = torch.optim.Adam(model.parameters(), lr=base_lr)
     scheduler_name = str(run_cfg.get("scheduler", "none")).lower()
     if scheduler_name == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -282,6 +303,11 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported scheduler: {scheduler_name}. Use one of ['none', 'cosine', 'step']")
 
+    warmup_epochs = max(0, int(run_cfg.get("warmup_epochs", 0)))
+    total_warmup_steps = warmup_epochs * max(len(train_loader), 1)
+    grad_clip_norm = float(run_cfg.get("grad_clip_norm", 0.0))
+    nan_guard = bool(run_cfg.get("nan_guard", True))
+
     wandb_run = maybe_init_wandb(run_cfg, cfg)
 
     last_train_logloss = 0.0
@@ -297,6 +323,8 @@ def main() -> None:
     bad_epochs = 0
 
     global_step = 0
+    stop_on_error = False
+
     for epoch in range(1, run_cfg["epochs"] + 1):
         model.train()
         total_train_loss = 0.0
@@ -307,6 +335,10 @@ def main() -> None:
         use_progress_bar = bool(run_cfg.get("progress_bar", True))
 
         for batch_idx, batch in enumerate(train_loader, start=1):
+            if total_warmup_steps > 0 and global_step < total_warmup_steps:
+                warmup_factor = float(global_step + 1) / float(total_warmup_steps)
+                _set_lr(opt, base_lr * warmup_factor)
+
             dense = batch["dense"].to(run_cfg["device"])
             sparse = batch["sparse"].to(run_cfg["device"])
             seq = batch["seq"].to(run_cfg["device"])
@@ -315,8 +347,34 @@ def main() -> None:
             logits = model(dense, sparse, seq)
             loss = F.binary_cross_entropy_with_logits(logits, label)
 
+            if nan_guard and (not _all_finite(logits) or not _all_finite(loss)):
+                print(
+                    f"[nan-guard] Non-finite detected before backward: epoch={epoch} batch={batch_idx} "
+                    f"lr={opt.param_groups[0]['lr']:.8f}"
+                )
+                stop_on_error = True
+                break
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
+
+            if nan_guard:
+                bad_grad = False
+                for p in model.parameters():
+                    if p.grad is not None and (not _all_finite(p.grad)):
+                        bad_grad = True
+                        break
+                if bad_grad:
+                    print(
+                        f"[nan-guard] Non-finite gradient detected: epoch={epoch} batch={batch_idx} "
+                        f"lr={opt.param_groups[0]['lr']:.8f}"
+                    )
+                    stop_on_error = True
+                    break
+
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
             opt.step()
 
             bsz = dense.size(0)
@@ -338,15 +396,19 @@ def main() -> None:
                     f"[{bar}] {pct:5.1f}% "
                     f"b{batch_idx}/{n_batches} "
                     f"loss={loss.item():.5f} avg={avg_loss:.5f} "
+                    f"lr={opt.param_groups[0]['lr']:.8f} "
                     f"{sec_per_batch:.3f}s/b eta={_format_seconds(eta_sec)}"
                 )
                 if use_progress_bar:
-                    print(line.ljust(140), end="\n" if is_last_batch else "\r", flush=True)
+                    print(line.ljust(160), end="\n" if is_last_batch else "\r", flush=True)
                 else:
                     print(line)
 
             if wandb_run is not None and global_step % run_cfg["wandb_log_interval"] == 0:
                 wandb_run.log({"train/batch_logloss": loss.item(), "train/epoch": epoch}, step=global_step)
+
+        if stop_on_error:
+            break
 
         train_logloss = total_train_loss / max(total_samples, 1)
         val_metrics = evaluate(model, val_loader, run_cfg["device"])
@@ -378,7 +440,7 @@ def main() -> None:
                 step=global_step,
             )
 
-        if scheduler is not None:
+        if scheduler is not None and epoch >= warmup_epochs:
             scheduler.step()
 
         monitor_values = {
@@ -410,7 +472,7 @@ def main() -> None:
             break
 
     test_metrics = None
-    if test_loader is not None:
+    if (not stop_on_error) and test_loader is not None:
         test_metrics = evaluate(model, test_loader, run_cfg["device"])
         print(
             f"test_auc={test_metrics['auc']:.5f} "
@@ -429,6 +491,7 @@ def main() -> None:
             "train_logloss": last_train_logloss,
             "val": last_val_metrics,
             "test": test_metrics,
+            "stopped_on_nan": stop_on_error,
             "early_stop": {
                 "metric": early_stop_metric,
                 "patience": early_stop_patience,
