@@ -37,5 +37,6 @@
   "early_stop_min_delta": 0.0001,
   "early_stop_metric": "val_logloss",
 
-  "save_metrics_path": "results/repro_cosine.json"
+  "save_metrics_path": "results/repro_cosine.json",
+  "save_best_checkpoint_path": "results/repro_cosine.best.pt"
 }

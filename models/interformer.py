@@ -35,8 +35,7 @@ class InterFormerConfig:
 
     @property
     def n_nonseq_tokens(self) -> int:
-        # 1 dense token + num_sparse sparse tokens
-        return 1 + self.num_sparse
+        return self.num_sparse + int(self.num_dense > 0)
 
 
 class MLP(nn.Module):
@@ -88,7 +87,7 @@ class SequencePreprocessor(nn.Module):
     def __init__(self, cfg: InterFormerConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.seq_embeddings = nn.ModuleList([nn.Embedding(v, cfg.d_model) for v in cfg.seq_vocab_sizes])
+        self.seq_embeddings = nn.ModuleList([nn.Embedding(v, cfg.d_model, padding_idx=0) for v in cfg.seq_vocab_sizes])
         seq_in_dim = cfg.num_seq_fields * cfg.d_model
         self.mask_mlp = nn.Sequential(nn.Linear(seq_in_dim, seq_in_dim), nn.SiLU(), nn.Linear(seq_in_dim, seq_in_dim))
         self.lce_mlp = nn.Linear(seq_in_dim, cfg.d_model)
@@ -235,7 +234,7 @@ class RoPEMultiheadSelfAttention(nn.Module):
     def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return x * cos + self._rotate_half(x) * sin
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         # x: [B, T, D]
         bsz, seq_len, _ = x.shape
         qkv = self.qkv(x).view(bsz, seq_len, 3, self.n_heads, self.head_dim)
@@ -248,6 +247,8 @@ class RoPEMultiheadSelfAttention(nn.Module):
         k = self._apply_rope(k, cos, sin)
 
         attn = torch.matmul(q, k.transpose(-1, -2)) / (self.head_dim ** 0.5)
+        if key_padding_mask is not None:
+            attn = attn.masked_fill(key_padding_mask[:, None, None, :], torch.finfo(attn.dtype).min)
         attn = torch.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
 
@@ -279,16 +280,26 @@ class SequenceArchBlock(nn.Module):
         self.ffn = MLP([cfg.d_model, cfg.d_model * 2, cfg.d_model], dropout=cfg.dropout)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, xsum: torch.Tensor, seq: torch.Tensor) -> torch.Tensor:
+    def forward(self, xsum: torch.Tensor, seq: torch.Tensor, seq_mask: torch.Tensor) -> torch.Tensor:
+        seq_mask_f = seq_mask.unsqueeze(-1).to(dtype=seq.dtype)
         z = seq + self.drop(self.pffn(xsum, seq))
+        z = z * seq_mask_f
 
         if self.use_rope:
-            a = self.mha_rope(self.norm1(z))
+            a = self.mha_rope(self.norm1(z), key_padding_mask=~seq_mask)
         else:
-            a, _ = self.mha(self.norm1(z), self.norm1(z), self.norm1(z), need_weights=False)
+            a, _ = self.mha(
+                self.norm1(z),
+                self.norm1(z),
+                self.norm1(z),
+                key_padding_mask=~seq_mask,
+                need_weights=False,
+            )
 
         z = z + self.drop(a)
+        z = z * seq_mask_f
         z = z + self.drop(self.ffn(self.norm2(z)))
+        z = z * seq_mask_f
         return z
 
 
@@ -307,14 +318,31 @@ class CrossArch(nn.Module):
         xsum = self.nonseq_lce(x_nonseq)
         return self.nonseq_gate(xsum)
 
-    def summarize_seq(self, seq: torch.Tensor) -> torch.Tensor:
+    def _masked_recent_tokens(self, seq: torch.Tensor, seq_mask: torch.Tensor) -> torch.Tensor:
+        if self.cfg.n_recent_tokens <= 0:
+            return seq[:, :0, :]
+
+        steps = seq.size(1)
+        scores = torch.arange(steps, device=seq.device).unsqueeze(0).expand(seq.size(0), -1)
+        masked_scores = torch.where(seq_mask, scores, torch.full_like(scores, -1))
+        recent_idx = torch.topk(masked_scores, k=self.cfg.n_recent_tokens, dim=1).indices
+        recent_idx = torch.flip(recent_idx, dims=[1])
+
+        gather_idx = recent_idx.unsqueeze(-1).expand(-1, -1, seq.size(-1))
+        recent = torch.gather(seq, 1, gather_idx)
+        recent_mask = torch.gather(seq_mask, 1, recent_idx).unsqueeze(-1)
+        return recent * recent_mask.to(dtype=seq.dtype)
+
+    def summarize_seq(self, seq: torch.Tensor, seq_mask: torch.Tensor) -> torch.Tensor:
         bsz = seq.size(0)
         cls_part = seq[:, : self.cfg.n_nonseq_summary, :]
 
         q = self.pma_query.unsqueeze(0).expand(bsz, -1, -1)
-        pma_part, _ = self.pma(q, seq, seq, need_weights=False)
+        pma_part, _ = self.pma(q, seq, seq, key_padding_mask=~seq_mask, need_weights=False)
 
-        recent = seq[:, -self.cfg.n_recent_tokens :, :]
+        behavior_seq = seq[:, self.cfg.n_nonseq_summary :, :]
+        behavior_mask = seq_mask[:, self.cfg.n_nonseq_summary :]
+        recent = self._masked_recent_tokens(behavior_seq, behavior_mask)
         ssum = torch.cat([cls_part, pma_part, recent], dim=1)
         return self.seq_gate(ssum)
 
@@ -327,8 +355,10 @@ class InterFormer(nn.Module):
         valid_modes = {"sole", "sep", "n2s", "s2n", "int"}
         if cfg.interleave_mode not in valid_modes:
             raise ValueError(f"Unsupported interleave_mode: {cfg.interleave_mode}. Use one of {sorted(valid_modes)}")
+        if cfg.n_nonseq_tokens <= 0:
+            raise ValueError("InterFormer requires at least one non-sequence token from dense or sparse features.")
 
-        self.dense_proj = nn.Linear(cfg.num_dense, cfg.d_model)
+        self.dense_proj = nn.Linear(cfg.num_dense, cfg.d_model) if cfg.num_dense > 0 else None
         self.sparse_embeddings = nn.ModuleList([nn.Embedding(v, cfg.d_model) for v in cfg.sparse_vocab_sizes])
         self.seq_pre = SequencePreprocessor(cfg)
 
@@ -368,9 +398,15 @@ class InterFormer(nn.Module):
         self.head = MLP([cfg.d_model * (cfg.n_nonseq_summary + self.n_seq_summary), 256, 64, 1], dropout=cfg.dropout)
 
     def preprocess_nonseq(self, dense_x: torch.Tensor, sparse_x: torch.Tensor) -> torch.Tensor:
-        dense_token = self.dense_proj(dense_x).unsqueeze(1)  # [B, 1, D]
+        tokens = []
+        if self.dense_proj is not None:
+            tokens.append(self.dense_proj(dense_x).unsqueeze(1))
         sparse_tokens = [emb(sparse_x[:, i]).unsqueeze(1) for i, emb in enumerate(self.sparse_embeddings)]
-        return torch.cat([dense_token] + sparse_tokens, dim=1)
+        tokens.extend(sparse_tokens)
+        return torch.cat(tokens, dim=1)
+
+    def _build_seq_mask(self, seq_x: torch.Tensor) -> torch.Tensor:
+        return seq_x.ne(0).any(dim=1)
 
     def _blank_seq_summary(self, seq: torch.Tensor) -> torch.Tensor:
         bsz = seq.size(0)
@@ -384,6 +420,7 @@ class InterFormer(nn.Module):
         # X(1), S(1)
         x = self.preprocess_nonseq(dense_x, sparse_x)
         s = self.seq_pre(seq_x)
+        seq_mask = self._build_seq_mask(seq_x)
 
         # first-layer prepend: only allow non-seq->seq when mode in {int, n2s}
         use_nonseq_to_seq = self.cfg.interleave_mode in {"int", "n2s"}
@@ -392,10 +429,15 @@ class InterFormer(nn.Module):
         else:
             xsum_init = self.cls_tokens.unsqueeze(0).expand(x.size(0), -1, -1)
         s = torch.cat([xsum_init, s], dim=1)
+        prefix_mask = torch.ones(x.size(0), self.cfg.n_nonseq_summary, device=seq_mask.device, dtype=torch.bool)
+        s_mask = torch.cat([prefix_mask, seq_mask], dim=1)
 
         if self.cfg.interleave_mode == "sole":
             # naive early sequence summarization, then interaction-only stacking
-            seq_mean = s[:, self.cfg.n_nonseq_summary :, :].mean(dim=1, keepdim=True)
+            behavior = s[:, self.cfg.n_nonseq_summary :, :]
+            behavior_mask = s_mask[:, self.cfg.n_nonseq_summary :].unsqueeze(-1).to(dtype=s.dtype)
+            denom = behavior_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            seq_mean = (behavior * behavior_mask).sum(dim=1, keepdim=True) / denom
             ssum_sole = seq_mean.expand(-1, self.n_seq_summary, -1)
             for inter_block in self.interaction_blocks:
                 x = inter_block(x, ssum_sole)
@@ -404,25 +446,25 @@ class InterFormer(nn.Module):
         else:
             for inter_block, seq_block in zip(self.interaction_blocks, self.sequence_blocks):
                 xsum = self.cross.summarize_nonseq(x)
-                ssum = self.cross.summarize_seq(s)
+                ssum = self.cross.summarize_seq(s, s_mask)
                 zero_xsum = self._blank_nonseq_summary(x)
                 zero_ssum = self._blank_seq_summary(s)
 
                 if self.cfg.interleave_mode == "int":
                     x = inter_block(x, ssum)
-                    s = seq_block(xsum, s)
+                    s = seq_block(xsum, s, s_mask)
                 elif self.cfg.interleave_mode == "sep":
                     x = inter_block(x, zero_ssum)
-                    s = seq_block(zero_xsum, s)
+                    s = seq_block(zero_xsum, s, s_mask)
                 elif self.cfg.interleave_mode == "n2s":
                     x = inter_block(x, zero_ssum)
-                    s = seq_block(xsum, s)
+                    s = seq_block(xsum, s, s_mask)
                 elif self.cfg.interleave_mode == "s2n":
                     x = inter_block(x, ssum)
-                    s = seq_block(zero_xsum, s)
+                    s = seq_block(zero_xsum, s, s_mask)
 
             xsum = self.cross.summarize_nonseq(x)
-            ssum = self.cross.summarize_seq(s)
+            ssum = self.cross.summarize_seq(s, s_mask)
 
         features = torch.cat([xsum.flatten(1), ssum.flatten(1)], dim=1)
         logit = self.head(features).squeeze(-1)

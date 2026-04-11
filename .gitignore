@@ -1,4 +1,5 @@
 ﻿data/*
 wandb/*
+results/repro_cosine.best.pt
 !data/ctr_dataset.py
 !data/__init__.py

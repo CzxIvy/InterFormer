@@ -34,6 +34,15 @@ def load_json(path: str | Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _default_best_checkpoint_path(run_cfg: Dict[str, Any]) -> str:
+    metrics_path = str(run_cfg.get("save_metrics_path", "") or "").strip()
+    if metrics_path:
+        path = Path(metrics_path)
+        return str(path.with_suffix(".best.pt"))
+    run_name = str(run_cfg.get("wandb_run_name", "") or "").strip() or "interformer"
+    return str(Path("results") / f"{run_name}.best.pt")
+
+
 def maybe_init_wandb(cfg_cli: Dict[str, Any], cfg_model):
     if not cfg_cli.get("use_wandb", False):
         return None
@@ -132,6 +141,7 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--save-metrics-path", type=str, default=None)
+    parser.add_argument("--save-best-checkpoint-path", type=str, default=None)
     return parser.parse_args()
 
 
@@ -169,6 +179,7 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "early_stop_min_delta": 0.0,
         "early_stop_metric": "val_logloss",
         "save_metrics_path": "",
+        "save_best_checkpoint_path": "",
     }
 
     file_cfg: Dict[str, Any] = {}
@@ -204,6 +215,7 @@ def _build_runtime_cfg(args: argparse.Namespace) -> Dict[str, Any]:
         "early_stop_min_delta": args.early_stop_min_delta,
         "early_stop_metric": args.early_stop_metric,
         "save_metrics_path": args.save_metrics_path,
+        "save_best_checkpoint_path": args.save_best_checkpoint_path,
     }
 
     merged = {**defaults, **file_cfg}
@@ -284,7 +296,7 @@ def main() -> None:
         )
 
     base_lr = float(run_cfg["lr"])
-    opt = torch.optim.Adam(model.parameters(), lr=base_lr)
+    opt = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=1e-5)
     scheduler_name = str(run_cfg.get("scheduler", "none")).lower()
     if scheduler_name == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -309,9 +321,11 @@ def main() -> None:
     nan_guard = bool(run_cfg.get("nan_guard", True))
 
     wandb_run = maybe_init_wandb(run_cfg, cfg)
+    best_ckpt_path = str(run_cfg.get("save_best_checkpoint_path", "") or _default_best_checkpoint_path(run_cfg))
 
     last_train_logloss = 0.0
     last_val_metrics = {"auc": 0.0, "gauc": 0.0, "logloss": 0.0}
+    best_val_metrics = {"auc": 0.0, "gauc": 0.0, "logloss": 0.0}
 
     early_stop_metric = str(run_cfg.get("early_stop_metric", "val_logloss"))
     early_stop_patience = int(run_cfg.get("early_stop_patience", 0))
@@ -458,7 +472,30 @@ def main() -> None:
         if improved:
             best_metric = current_metric
             best_epoch = epoch
+            best_val_metrics = dict(val_metrics)
             bad_epochs = 0
+            ckpt_path = Path(best_ckpt_path)
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                    "best_metric": best_metric,
+                    "best_epoch": best_epoch,
+                    "monitor": early_stop_metric,
+                    "run_config": run_cfg,
+                    "model_config": asdict(cfg),
+                    "val_metrics": val_metrics,
+                },
+                ckpt_path,
+            )
+            print(
+                f"[checkpoint] saved best model: epoch={epoch} "
+                f"monitor={early_stop_metric} value={current_metric:.5f} path={ckpt_path}"
+            )
         else:
             bad_epochs += 1
 
@@ -472,6 +509,15 @@ def main() -> None:
             break
 
     test_metrics = None
+    if best_epoch > 0 and Path(best_ckpt_path).exists():
+        best_checkpoint = torch.load(best_ckpt_path, map_location=run_cfg["device"])
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        print(
+            f"[checkpoint] loaded best model: epoch={best_epoch} "
+            f"monitor={early_stop_metric} best={best_metric:.5f} path={best_ckpt_path}"
+        )
+        last_val_metrics = dict(best_val_metrics)
+
     if (not stop_on_error) and test_loader is not None:
         test_metrics = evaluate(model, test_loader, run_cfg["device"])
         print(
@@ -499,6 +545,7 @@ def main() -> None:
                 "best_metric": best_metric,
                 "best_epoch": best_epoch,
             },
+            "best_checkpoint_path": best_ckpt_path,
             "run_config": run_cfg,
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
